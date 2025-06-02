@@ -92,7 +92,7 @@ ENV PIP_FIND_LINKS=https://storage.googleapis.com/jax-releases/libtpu_releases.h
 RUN pip install .[core,tpu]
 RUN if [ -n "$EXTRAS" ]; then pip install .[$EXTRAS]; fi
 COPY . .
-RUN pip install git+https://github.com/google/orbax.git@test_765598157#subdirectory=checkpoint
+# RUN pip install -f --force-reinstall git+https://github.com/google/orbax.git@test_765598157#subdirectory=checkpoint
 
 
 ################################################################################

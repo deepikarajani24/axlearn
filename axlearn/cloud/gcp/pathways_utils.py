@@ -207,6 +207,8 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
         staging_location = f"{cfg.output_dir}/pathways-staging"
         pathways_tpu_version = get_pathways_tpu_version(system.gce_machine_type)
 
+        env = [{"name": "IFRT_PROXY_USE_INSECURE_GRPC_CREDENTIALS", "value": "yes"}]
+
         # If multi-head, every pathways-head will only
         # be connected to one pathways instance (a pathways-worker replicated job).
         pathways_instance_count = cfg.accelerator.num_replicas if self._is_single_head else 1
@@ -218,6 +220,7 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
                 # https://kubernetes.io/docs/concepts/workloads/pods/sidecar-containers/#pod-sidecar-containers
                 # SideCar container is an init container with restartPolicy as "Always".
                 restartPolicy="Always",
+                env=env,
                 args=[
                     f"--resource_manager_address=localhost:{_PATHWAYS_RESOURCE_MANAGER_PORT}",
                     f"--server_port={_PATHWAYS_PROXY_PORT}",

@@ -92,6 +92,9 @@ ENV PIP_FIND_LINKS=https://storage.googleapis.com/jax-releases/libtpu_releases.h
 RUN pip install .[core,tpu]
 RUN if [ -n "$EXTRAS" ]; then pip install .[$EXTRAS]; fi
 COPY . .
+RUN apt-get update -y && apt-get install -y libc++-19-dev
+COPY jaxlib-0.5.3.dev20250604-cp310-cp310-manylinux2014_x86_64.whl .
+RUN pip install jaxlib-0.5.3.dev20250604-cp310-cp310-manylinux2014_x86_64.whl
 # RUN pip install -f --force-reinstall git+https://github.com/google/orbax.git@test_765598157#subdirectory=checkpoint
 
 

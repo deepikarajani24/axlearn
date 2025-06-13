@@ -2,14 +2,14 @@
 
 set -xe
 
-export NUM_REPLICAS=${NUM_REPLICAS:-2}
-export JOBSET_NAME=${JOBSET_NAME:-$USER}
+export NUM_REPLICAS=${NUM_REPLICAS:-1}
+export JOBSET_NAME=${JOBSET_NAME:-$USER-directtogcs}
 export BASTION_TIER=disabled
 export GKE_CLUSTER=$(axlearn gcp config | grep gke_cluster | awk '{ print $3 }' | tr -d '"')
 # Switch to tpu-v6e-256 if on scale cluster
-export INSTANCE_TYPE=${INSTANCE_TYPE:-"tpu-v6e-16"}
+export INSTANCE_TYPE=${INSTANCE_TYPE:-"tpu-v6e-256"}
 # Switch to tpu-v6e-256-4 if on scale cluster
-export MESH_SELECTOR=${MESH:-"tpu-v6e-16"}
+export MESH_SELECTOR=${MESH:-"tpu-v6e-4"}
 export CONFIG=${CONFIG:-"fuji-7B-v2-flash-orbaxem"}
 export PROJECT_ID=$(gcloud config get project)
 
@@ -35,6 +35,7 @@ if [[ "$CONFIG" == *"orbaxem"* ]]; then
         --runner_name gke_tpu_single \
         --name=$JOBSET_NAME \
         --instance_type=${INSTANCE_TYPE} \
+        --priority_class=high \
         --host_mount_spec=name=tmp,host_path=/tmp,mount_path=/host-tmp \
         --num_replicas=${NUM_REPLICAS} \
         --bundler_spec=allow_dirty=True \
@@ -44,8 +45,8 @@ if [[ "$CONFIG" == *"orbaxem"* ]]; then
           --init_module=axlearn.common.checkpointer_orbax_emergency:local_ckpt_dir=/host-tmp/checkpoints \
           --module=text.gpt.c4_trainer \
           --config=${CONFIG} \
-          --trainer_dir=gs://${PROJECT_ID}-axlearn/${JOBSET_NAME}-nr-${NUM_REPLICAS}/ \
-          --data_dir=gs://axlearn-public/tensorflow_datasets  \
+          --trainer_dir=gs://tess-dataset-southamerica-west1/deepikarajani-directtogcs-64/ \
+          --data_dir=gs://tess-dataset-southamerica-west1  \
           --jax_backend=tpu \
           --mesh_selector=${MESH_SELECTOR} \
           --initialization_timeout=1200 \

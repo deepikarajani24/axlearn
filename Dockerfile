@@ -93,6 +93,7 @@ RUN pip install .[core,tpu]
 RUN if [ -n "$EXTRAS" ]; then pip install .[$EXTRAS]; fi
 COPY . .
 # RUN pip install -f --force-reinstall git+https://github.com/google/orbax.git@test_765598157#subdirectory=checkpoint
+RUN pip install -U "orbax-checkpoint==0.11.13"
 
 
 ################################################################################

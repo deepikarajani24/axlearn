@@ -9,7 +9,7 @@ export GKE_CLUSTER=$(axlearn gcp config | grep gke_cluster | awk '{ print $3 }' 
 # Switch to tpu-v6e-256 if on scale cluster
 export INSTANCE_TYPE=${INSTANCE_TYPE:-"tpu-v6e-256"}
 # Switch to tpu-v6e-256-4 if on scale cluster
-export MESH_SELECTOR=${MESH:-"tpu-v6e-4"}
+export MESH_SELECTOR=${MESH:-"tpu-v6e-256-4"}
 export CONFIG=${CONFIG:-"fuji-7B-v2-flash-orbaxem"}
 export PROJECT_ID=$(gcloud config get project)
 

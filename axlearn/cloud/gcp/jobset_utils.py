@@ -88,7 +88,7 @@ class GCSFuseMount(VolumeMount):
 
     gcs_path: str
     name: str = "gcs-fuse-csi-ephemeral"
-    mount_path: str = "/output"
+    mount_path: str = "/tmp/dataset"
     cpu: str = "250m"
     memory: str = "256Mi"
     ephemeral_gb: str = "5Gi"
@@ -585,9 +585,9 @@ class TPUReplicatedJob(SingleReplicatedJob):
                         volumeAttributes=dict(
                             bucketName=parsed.netloc,
                             # pylint: disable=line-too-long
-                            mountOptions=f"only-dir={parsed.path.lstrip('/')},implicit-dirs,metadata-cache:ttl-secs:-1,metadata-cache:stat-cache-max-size-mb:-1,metadata-cache:type-cache-max-size-mb:-1,kernel-list-cache-ttl-secs=-1,gcs-connection:http-client-timeout:{cfg.gcsfuse_mount.http_client_timeout}",
+                            mountOptions="implicit-dirs,metadata-cache:negative-ttl-secs:0,metadata-cache:ttl-secs:-1,metadata-cache:stat-cache-max-size-mb:-1,metadata-cache:type-cache-max-size-mb:-1,file-cache:max-size-mb:-1,file-cache:cache-file-for-range-read:true,file-cache:enable-parallel-downloads:true,read_ahead_kb=1024,write:enable-streaming-writes:true,logging:severity:trace",
                             gcsfuseMetadataPrefetchOnMount="true",  # Improves first-time read.
-                            disableMetrics="false",  # Enables GCSFuse metrics by default.
+                            #disableMetrics="false",  # Enables GCSFuse metrics by default.
                         ),
                     ),
                 )

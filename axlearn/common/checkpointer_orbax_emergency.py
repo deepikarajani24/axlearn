@@ -98,7 +98,7 @@ class _TFSavablesStateStorage(StateStorage):
 
     @config_class
     class Config(StateStorage.Config):
-        timeout_secs: int = 300
+        timeout_secs: int = 600
 
     def __init__(self, cfg: Config):
         super().__init__(cfg)
@@ -259,7 +259,7 @@ def _logger_init():
 def _init_consistent_proc_ids(
     *,
     local_address: Optional[str] = None,
-    barrier_timeout_seconds: int = 300,
+    barrier_timeout_seconds: int = 600,
     trainer_dir: str,
     local_ckpt_dir: str,
     **setup_kwargs,
@@ -413,7 +413,7 @@ def _init_consistent_proc_ids(
 def get_consistent_proc_info(
     *,
     local_address: Optional[str] = None,
-    barrier_timeout_seconds: int = 300,
+    barrier_timeout_seconds: int = 600,
     trainer_dir: str,
     local_ckpt_dir: str,
     **setup_kwargs,
@@ -586,7 +586,7 @@ class OrbaxEmergencyCheckpointer(BaseCheckpointer):
         ).set(n=10)
         local_dir: str = "/host-tmp/checkpoints"
         trainer_dir: Required[str] = REQUIRED
-        non_tensor_async_timeout_secs: int = 300
+        non_tensor_async_timeout_secs: int = 600
         async_timeout_secs: int = 3600
         replica_axis_index: Required[int] = REQUIRED
 

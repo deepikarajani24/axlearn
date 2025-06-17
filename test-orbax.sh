@@ -51,7 +51,7 @@ if [[ "$CONFIG" == *"orbaxem"* && "$ENABLE_GCSFUSE" == "true" ]]; then
           --jax_backend=tpu \
           --mesh_selector=${MESH_SELECTOR} \
           --initialization_timeout=1200 \
-          --trace_at_steps=29,59,89,119,149,179,209,239,269,299
+          --trace_at_steps=29,59,89,119,149,179,209,239,269,299.329,359,389,419,449,479,509,539,569,599,629,659,689,719
 # If CONFIG ends with "orbaxem" but ENABLE_GCSFUSE is NOT true
 elif [[ "$CONFIG" == *"orbaxem"* ]]; then
   echo "Running with Orbax emergency checkpointer."

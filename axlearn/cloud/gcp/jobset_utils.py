@@ -554,6 +554,12 @@ class TPUReplicatedJob(SingleReplicatedJob):
             # Increases the shared memory volumes when enabled gcsfuse. This is useful when grain
             # prefetch is enabled.
             volumes.append(self._build_shared_memory_volumes(cfg.gcsfuse_mount.shared_memory))
+            volumes.append(
+                {
+                    "name": "gke-gcsfuse-cache",
+                    "emptyDir": {"medium": "Memory"},
+                }
+            )
             # Mount a GCS bucket as a volume.
             annotations.update(
                 {
@@ -585,7 +591,7 @@ class TPUReplicatedJob(SingleReplicatedJob):
                         volumeAttributes=dict(
                             bucketName=parsed.netloc,
                             # pylint: disable=line-too-long
-                            mountOptions="implicit-dirs,metadata-cache:negative-ttl-secs:0,metadata-cache:ttl-secs:-1,metadata-cache:stat-cache-max-size-mb:-1,metadata-cache:type-cache-max-size-mb:-1,file-cache:max-size-mb:-1,file-cache:cache-file-for-range-read:true,file-cache:enable-parallel-downloads:true,read_ahead_kb=1024,write:enable-streaming-writes:true",
+                            mountOptions="implicit-dirs,metadata-cache:negative-ttl-secs:0,metadata-cache:ttl-secs:-1,metadata-cache:stat-cache-max-size-mb:-1,metadata-cache:type-cache-max-size-mb:-1,read_ahead_kb=1024,write:enable-streaming-writes:true",
                             gcsfuseMetadataPrefetchOnMount="true",  # Improves first-time read.
                             #disableMetrics="false",  # Enables GCSFuse metrics by default.
                         ),
@@ -718,6 +724,7 @@ class TPUReplicatedJob(SingleReplicatedJob):
             # https://kubernetes.io/docs/tasks/network/customize-hosts-file-for-pods/#adding-additional-entries-with-hostaliases
             hostAliases=[metadata_host_alias],
             nodeSelector={
+                #"cloud.google.com/gke-nodepool": "bodaborg-v6e-256-lcscld-c-np-0",
                 "cloud.google.com/gke-tpu-accelerator": system.gke_accelerator,
                 "cloud.google.com/gke-tpu-topology": system.topology,
                 **selector,
@@ -834,6 +841,10 @@ class GPUReplicatedJob(SingleReplicatedJob):
         volumes = [
             {
                 "name": "shared-memory",
+                "emptyDir": {"medium": "Memory"},
+            },
+            {
+                "name": "gke-gcsfuse-cache",
                 "emptyDir": {"medium": "Memory"},
             },
             {

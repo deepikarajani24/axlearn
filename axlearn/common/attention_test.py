@@ -41,6 +41,7 @@ from transformers.models.xlnet import modeling_xlnet as hf_xlnet
 
 from axlearn.common import attention, attention_bias, test_utils, utils
 from axlearn.common.attention import (
+    BaseQKVLinear,
     BaseStackedTransformerLayer,
     BaseTransformerLayer,
     BottleNeckAdapterTransformerLayer,
@@ -82,7 +83,6 @@ from axlearn.common.attention import (
 from axlearn.common.attention_bias import (
     NEG_INF,
     CausalAttentionBias,
-    SlidingWindowAttentionBias,
     bool_to_bias,
     causal_mask,
     make_causal_biases,
@@ -103,6 +103,7 @@ from axlearn.common.config import (
     maybe_set_config,
 )
 from axlearn.common.decoder import Decoder, TransformerTextEmbeddings
+from axlearn.common.kv_cache.sliding_window_kv_cache import enable_sliding_window_attention
 from axlearn.common.layers import RMSNorm, set_bias_recursively
 from axlearn.common.module import InvocationContext, Module
 from axlearn.common.module import functional as F
@@ -821,7 +822,7 @@ class RoFormerSinusoidalPositionalEmbeddingTest(TestCase):
         ref_layer = hf_roformer.RoFormerSinusoidalPositionalEmbedding(max_len, dim)
         # In recent transformers API, PE's `_init_weight` is called recursively by parent module.
         # Since we only initialize the PE layer here, we need to manually call it.
-        ref_layer._init_weight()  # pylint: disable=protected-access
+        ref_layer._init_weight()  # pylint: disable=protected-access, no-value-for-parameter
         ref_output = ref_layer(as_torch_tensor(token_ids).shape)
         # Set up the RoPE AXLearn configs.
         test_layer = (
@@ -1320,6 +1321,14 @@ class RoFormerSinusoidalPositionalEmbeddingAgainstLLaMATest(TestCase):
 
 class MultiheadLinearInitTest(TestCase):
     """Tests MultiheadLinear initialization."""
+
+    def test_unique_config_classes(self):
+        self.assertFalse(
+            isinstance(MultiheadInputLinear.default_config(), MultiheadOutputLinear.Config)
+        )
+        self.assertFalse(
+            isinstance(MultiheadOutputLinear.default_config(), MultiheadInputLinear.Config)
+        )
 
     @parameterized.parameters(
         (
@@ -1860,6 +1869,26 @@ def _convert_to_qkv_linear(
     return test_state
 
 
+class TestQLinearWithKvUpdate(QLinear):
+    """QLinear that adjusts the external KV for testing purposes."""
+
+    def forward(
+        self,
+        query: Tensor,
+        *,
+        kv_state: KVState,
+        key: Optional[Tensor] = None,
+        value: Optional[Tensor] = None,
+        query_positions: Optional[Tensor] = None,
+    ) -> BaseQKVLinear.Output:
+        query, key, value = super().forward(
+            query, kv_state=kv_state, key=key, value=value, query_positions=query_positions
+        )
+        key = key + 1.0
+        value = value - 1.0
+        return BaseQKVLinear.Output(query, key, value)
+
+
 class MultiheadAttentionTest(TestCase):
     """Tests MultiheadAttention, GroupedQueryAttention, and associated layers."""
 
@@ -2308,10 +2337,7 @@ class MultiheadAttentionTest(TestCase):
         layer_params = ref_layer.initialize_parameters_recursively(prng_key=jax.random.PRNGKey(123))
 
         sliding_window_size = 2
-        test_cfg = ref_cfg.clone(
-            causal=None,
-            mask=SlidingWindowAttentionBias.default_config(sliding_window_size=sliding_window_size),
-        )
+        test_cfg = enable_sliding_window_attention(ref_cfg, sliding_window_size)
         test_layer = test_cfg.instantiate(parent=None)
 
         batch_size, seq_len = 2, 4
@@ -2468,7 +2494,7 @@ class MultiheadAttentionTest(TestCase):
         key = value = kv_state = None
         if attention_cfg.klass == attention.GroupedQueryAttention:
             pass
-        elif attention_cfg.input_linear.klass == QLinear:
+        elif attention_cfg.input_linear.klass in (QLinear, TestQLinearWithKvUpdate):
             kv_state = KVState(
                 k_proj=jax.random.normal(
                     jax.random.PRNGKey(124), [batch_size, tgt_len, num_heads, head_dim], dtype=dtype
@@ -2482,7 +2508,7 @@ class MultiheadAttentionTest(TestCase):
             # Make key and value distinct from query. Otherwise, it is equivalent
             # to the query only case.
             key = value = query + 0.1
-        return_aux = {"probs"}
+        return_aux = {"probs", "kv_state"}
         inputs = dict(
             query=query,
             key=key,
@@ -2531,15 +2557,24 @@ class MultiheadAttentionTest(TestCase):
             decoder_output.append(extend_step_outputs.data)
             decoder_probs.append(extend_step_outputs.probs)
         decoder_output = jnp.concatenate(decoder_output, axis=1)
-        decoder_probs = jnp.concatenate(decoder_probs, axis=2)
         assert_allclose(decoder_output, forward_outputs.data, atol=1e-6)
-        assert_allclose(decoder_probs, forward_outputs.probs, atol=1e-6)
+        # When not using KVCache, the source positions are not always full positions.
+        # e.g., SlidingWindowKVCache returns probs for only sliding window size.
+        if cfg.kv_cache is None or cfg.kv_cache.klass == KVCache:
+            decoder_probs = jnp.concatenate(decoder_probs, axis=2)
+            assert_allclose(decoder_probs, forward_outputs.probs, atol=1e-6)
+            self.assertNestedAllClose(
+                extend_step_outputs.kv_state.k_proj, forward_outputs.kv_state.k_proj, atol=1e-6
+            )
+            self.assertNestedAllClose(
+                extend_step_outputs.kv_state.v_proj, forward_outputs.kv_state.v_proj, atol=1e-6
+            )
 
     @parameterized.product(
         dtype=(jnp.float32, jnp.float16, jnp.bfloat16),
         per_dim_scale=(None, PerDimScale.default_config()),
         atten_logit_cap=(0.0, 20.0),
-        input_linear=(QKVLinear, RoFormerQKVLinear, QLinear),
+        input_linear=(QKVLinear, RoFormerQKVLinear, QLinear, TestQLinearWithKvUpdate),
         bias=(True, False),
         causal_type=("causal", "sliding_window"),
         extend_step_len=(1, 4),
@@ -2554,8 +2589,8 @@ class MultiheadAttentionTest(TestCase):
         causal_type: str,
         extend_step_len: int,
     ):
-        if input_linear == QLinear and causal_type == "sliding_window":
-            pytest.skip("QLinear doesn't support sliding window mask.")
+        if input_linear in (QLinear, TestQLinearWithKvUpdate) and causal_type == "sliding_window":
+            pytest.skip("QLinear variants don't support sliding window mask.")
         model_dim = 16
         num_heads = 4
         if input_linear == attention.RoFormerQKVLinear:
@@ -2570,7 +2605,7 @@ class MultiheadAttentionTest(TestCase):
         if causal_type == "causal":
             cfg.mask = CausalAttentionBias.default_config()
         elif causal_type == "sliding_window":
-            cfg.mask = SlidingWindowAttentionBias.default_config(sliding_window_size=4)
+            cfg = enable_sliding_window_attention(cfg, sliding_window_size=4)
         else:
             raise ValueError(f"{causal_type} is not supportd.")
         self._test_extend_step(
@@ -2613,7 +2648,7 @@ class MultiheadAttentionTest(TestCase):
         if causal_type == "causal":
             cfg.mask = CausalAttentionBias.default_config()
         elif causal_type == "sliding_window":
-            cfg.mask = SlidingWindowAttentionBias.default_config(sliding_window_size=4)
+            cfg = enable_sliding_window_attention(cfg, sliding_window_size=4)
         else:
             raise ValueError(f"{causal_type} is not supportd.")
         self._test_extend_step(
@@ -2657,7 +2692,6 @@ class MultiheadAttentionTest(TestCase):
             # Make key and value distinct from query. Otherwise, it is equivalent
             # to the query only case.
             key = value = query + 0.1
-        attention_logit_biases = attention_bias.make_causal_biases(tgt_len)
         return_aux = {"probs"}
 
         forward_outputs, _ = F(
@@ -2669,7 +2703,6 @@ class MultiheadAttentionTest(TestCase):
                 query=query,
                 key=key,
                 value=value,
-                attention_logit_biases=attention_logit_biases,
                 return_aux=return_aux,
             ),
         )
@@ -2685,7 +2718,6 @@ class MultiheadAttentionTest(TestCase):
                 query=query,
                 key=key,
                 value=value,
-                attention_logit_biases=attention_logit_biases,
                 return_aux=return_aux,
             ),
             method="init_states",
@@ -2694,15 +2726,6 @@ class MultiheadAttentionTest(TestCase):
         # Check time_step and shapes of state.
         self.assertEqual(["time_step", "kv_cache"], list(initial_states.keys()))
         self.assertTrue(jnp.all(time_step == initial_states["time_step"]))
-        for proj in ["key", "value"]:
-            self.assertEqual(
-                (batch_size, num_kv_heads or num_heads, model_dim // num_heads, tgt_len),
-                initial_states["kv_cache"][proj].shape,
-            )
-            self.assertEqual(
-                dtype,
-                initial_states["kv_cache"][proj].dtype,
-            )
 
         # Zero-out outputs starting from initial time_step, and test that we can recover the full
         # outputs by calling extend_step starting from time_step.
@@ -2713,13 +2736,27 @@ class MultiheadAttentionTest(TestCase):
         # [batch, tgt_len, model_dim] --> [batch, model_dim, tgt_len].
         decoder_output = jnp.moveaxis(decoder_output, -2, -1)
 
+        # When not using KVCache, the source positions are not always full positions.
+        # e.g., SlidingWindowKVCache returns probs for only sliding window size.
+        vanilla_kvcache = cfg.kv_cache is None or cfg.kv_cache.klass == KVCache
+        if vanilla_kvcache:
+            for proj in ["key", "value"]:
+                self.assertEqual(
+                    (batch_size, num_kv_heads or num_heads, model_dim // num_heads, tgt_len),
+                    initial_states["kv_cache"][proj].shape,
+                )
+                self.assertEqual(
+                    dtype,
+                    initial_states["kv_cache"][proj].dtype,
+                )
+
         # [batch, num_heads, tgt_len, src_len].
-        if initial_output.probs is None:
-            decoder_probs = None
-        else:
+        if initial_output.probs is not None and vanilla_kvcache:
             decoder_probs = initial_output.probs * time_step_mask[:, None, :, None]
             # [batch, num_heads, tgt_len, src_len] --> [batch, num_heads, src_len, tgt_len].
             decoder_probs = jnp.moveaxis(decoder_probs, -2, -1)
+        else:
+            decoder_probs = None
 
         # Call extend_step from time_step, ensuring that outputs match.
         inputs = dict(cached_states=initial_states, return_aux=return_aux)
@@ -2735,10 +2772,6 @@ class MultiheadAttentionTest(TestCase):
                 inputs["value"] = jnp.take_along_axis(
                     value, time_step[:, None, None], axis=1, mode="clip"
                 )
-            # [batch=1, tgt_len=1, tgt_len].
-            inputs["attention_logit_biases"] = jnp.take_along_axis(
-                attention_logit_biases[None, :, :], time_step[:, None, None], axis=1, mode="clip"
-            )
             (updated_state, outputs), _ = F(
                 layer,
                 state=layer_params,
@@ -2757,24 +2790,26 @@ class MultiheadAttentionTest(TestCase):
             # [batch, 1, tgt_len].
             oh_indices = jax.nn.one_hot(time_step, tgt_len)[:, None, :]
             decoder_output = decoder_output + curr_outputs * oh_indices
-            # [batch, 1, 1, tgt_len].
-            oh_indices = oh_indices[..., None, :]
-            decoder_probs = decoder_probs + curr_probs * oh_indices
+            if decoder_probs is not None:
+                # [batch, 1, 1, tgt_len].
+                oh_indices = oh_indices[..., None, :]
+                decoder_probs = decoder_probs + curr_probs * oh_indices
             time_step = time_step + 1
 
         # [batch, model_dim, tgt_len] --> [batch, tgt_len, model_dim].
         decoder_output = jnp.moveaxis(decoder_output, -1, -2)
-        # [batch, num_heads, src_len, tgt_len] --> [batch, num_heads, tgt_len, src_len].
-        decoder_probs = jnp.moveaxis(decoder_probs, -1, -2)
-
         assert_allclose(decoder_output, forward_outputs.data)
-        assert_allclose(decoder_probs, forward_outputs.probs)
+        if decoder_probs is not None:
+            # [batch, num_heads, src_len, tgt_len] --> [batch, num_heads, tgt_len, src_len].
+            decoder_probs = jnp.moveaxis(decoder_probs, -1, -2)
+            assert_allclose(decoder_probs, forward_outputs.probs)
 
     @parameterized.product(
         dtype=(jnp.float32, jnp.float16, jnp.bfloat16),
         per_dim_scale=(None, PerDimScale.default_config()),
         atten_logit_cap=(0.0, 20.0),
         bias=(True, False),
+        causal_type=("causal", "sliding_window"),
         input_linear=(attention.QKVLinear, attention.RoFormerQKVLinear),
     )
     def test_prefill_states(
@@ -2783,6 +2818,7 @@ class MultiheadAttentionTest(TestCase):
         per_dim_scale: Optional[PerDimScale.Config],
         atten_logit_cap: float,
         bias: bool,
+        causal_type: str,
         input_linear: attention.BaseQKVLinear,
     ):
         model_dim = 16
@@ -2796,6 +2832,12 @@ class MultiheadAttentionTest(TestCase):
             atten_logit_cap=atten_logit_cap,
             input_linear=input_linear,
         )
+        if causal_type == "causal":
+            cfg.mask = CausalAttentionBias.default_config()
+        elif causal_type == "sliding_window":
+            cfg = enable_sliding_window_attention(cfg, sliding_window_size=4)
+        else:
+            raise ValueError(f"{causal_type} is not supportd.")
         self._test_prefill_states(
             cfg, model_dim=model_dim, num_heads=num_heads, dtype=dtype, bias=bias
         )
@@ -2807,6 +2849,7 @@ class MultiheadAttentionTest(TestCase):
         num_kv_heads=(1, 2, 4),
         input_linear=(attention.GroupedQKVLinear, attention.FusedGroupedQKVLinear),
         bias=(True, False),
+        causal_type=("causal", "sliding_window"),
     )
     def test_gqa_prefill_states(
         self,
@@ -2816,6 +2859,7 @@ class MultiheadAttentionTest(TestCase):
         num_kv_heads: int,
         input_linear: type[attention.BaseQKVLinear],
         bias: bool,
+        causal_type: str,
     ):
         model_dim = 16
         num_heads = 4
@@ -2824,6 +2868,12 @@ class MultiheadAttentionTest(TestCase):
             atten_logit_cap=atten_logit_cap,
             input_linear=input_linear.default_config().set(num_kv_heads=num_kv_heads),
         )
+        if causal_type == "causal":
+            cfg.mask = CausalAttentionBias.default_config()
+        elif causal_type == "sliding_window":
+            cfg = enable_sliding_window_attention(cfg, sliding_window_size=4)
+        else:
+            raise ValueError(f"{causal_type} is not supportd.")
         self._test_prefill_states(
             cfg,
             model_dim=model_dim,
@@ -5594,114 +5644,6 @@ class ConfigHelperTest(TestCase):
                     cross_atten.output_linear.param_partition_spec,
                     (fsdp_axis_names, tp_axis_names, None),
                 )
-
-
-class KVCacheTest(TestCase):
-    """Tests KVCache."""
-
-    @parameterized.product(
-        cached_kv_length=[8],
-        time_step_value=[2, 4],
-        cache_dtype=[None, jnp.bfloat16],
-        live_step_len=[-1, 2, 4],
-    )
-    def test_kv_cache(self, cached_kv_length, time_step_value, cache_dtype, live_step_len):
-        test_layer = (
-            KVCache.default_config()
-            .set(name="ref", cache_dtype=cache_dtype)
-            .instantiate(parent=None)
-        )
-
-        prng_key = jax.random.PRNGKey(2)
-        batch, step_len = 2, 4
-        heads, dim = 2, 2
-        step_shape = (batch, step_len, heads, dim)
-        k_proj = jax.random.normal(prng_key, shape=step_shape)
-        v_proj = jax.random.normal(prng_key, shape=step_shape)
-        key_positions = jnp.arange(step_len)[None] + time_step_value
-        if live_step_len < 0:
-            valid_step_len = step_len
-            live_step_len = None
-        else:
-            valid_step_len = live_step_len
-            live_step_len = jnp.full([batch], fill_value=live_step_len, dtype=jnp.int32)
-
-        kv_shape = KVCache.Shape(batch, cached_kv_length, heads, dim)
-        test_states = test_layer.init_states(kv_shape, dtype=k_proj.dtype)
-        expect_dtype = cache_dtype or k_proj.dtype
-
-        _, test_output = test_layer.extend_step(
-            test_states,
-            k_proj=k_proj,
-            v_proj=v_proj,
-            key_positions=key_positions,
-            live_step_len=live_step_len,
-        )
-
-        def check(input_kv, output_kv):
-            self.assertEqual(output_kv.shape, kv_shape)
-            self.assertEqual(output_kv.dtype, expect_dtype)
-            assert_allclose(output_kv[:, :time_step_value], 0)
-            assert_allclose(
-                output_kv[:, time_step_value : time_step_value + valid_step_len],
-                input_kv.astype(expect_dtype)[:, :valid_step_len],
-            )
-
-        check(k_proj, test_output.k_proj)
-        check(v_proj, test_output.v_proj)
-        key_positions = jnp.arange(cached_kv_length)[None]
-        assert_allclose(test_output.key_positions, key_positions)
-        # Currently, the part larger than live_step_len is also being overwritten in the KV cache.
-        # TODO(dhwang2): remove this check when KVCache updates only valid part.
-        assert_allclose(
-            test_output.k_proj[:, time_step_value : time_step_value + step_len],
-            k_proj.astype(expect_dtype)[:, :step_len],
-        )
-
-    @parameterized.product(cache_dtype=[None, jnp.bfloat16])
-    def test_kv_cache_onehot_vs_dynamic(self, cache_dtype):
-        test_layer = (
-            KVCache.default_config()
-            .set(name="test", cache_dtype=cache_dtype)
-            .instantiate(parent=None)
-        )
-
-        kv_len = 64
-        kv_shape = KVCache.Shape(2, kv_len, 2, 2)
-        onehot_states = test_layer.init_states(kv_shape, dtype=jnp.float32)
-        dynamic_states = test_layer.init_states(kv_shape, dtype=jnp.float32)
-
-        prng_key = jax.random.PRNGKey(2)
-        k_proj = jax.random.normal(prng_key, shape=kv_shape)
-        v_proj = jax.random.normal(prng_key, shape=kv_shape)
-
-        def extend_step(step_size, cached_states):
-            for i in range(0, kv_len, step_size):
-                k_step = k_proj[:, i : i + step_size]
-                v_step = v_proj[:, i : i + step_size]
-                key_positions = jnp.arange(step_size)[None] + i
-                cached_states, test_output = test_layer.extend_step(
-                    cached_states, k_proj=k_step, v_proj=v_step, key_positions=key_positions
-                )
-            return cached_states, test_output
-
-        onehot_states, onehot_output = extend_step(step_size=1, cached_states=onehot_states)
-        dynamic_states, dynamic_output = extend_step(step_size=32, cached_states=dynamic_states)
-
-        expect_dtype = cache_dtype or k_proj.dtype
-        assert_allclose(onehot_states["key"], dynamic_states["key"])
-        assert_allclose(onehot_states["value"], dynamic_states["value"])
-        self.assertEqual(onehot_states["key"].dtype, dynamic_states["key"].dtype)
-        self.assertEqual(onehot_states["value"].dtype, dynamic_states["value"].dtype)
-        self.assertEqual(onehot_states["key"].dtype, expect_dtype)
-        self.assertEqual(onehot_states["value"].dtype, expect_dtype)
-
-        assert_allclose(onehot_output.k_proj, dynamic_output.k_proj)
-        assert_allclose(onehot_output.v_proj, dynamic_output.v_proj)
-        self.assertEqual(onehot_output.k_proj.dtype, dynamic_output.k_proj.dtype)
-        self.assertEqual(onehot_output.v_proj.dtype, dynamic_output.v_proj.dtype)
-
-        assert_allclose(onehot_output.key_positions, dynamic_output.key_positions)
 
 
 class PositionalEmbeddingTest(TestCase):

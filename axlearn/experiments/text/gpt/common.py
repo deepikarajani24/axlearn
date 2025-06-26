@@ -712,7 +712,7 @@ def get_trainer_config_fn(
             cfg.evalers[name] = evaler_cfg
 
         # Summaries and checkpoints.
-        calculated_save_every_n_steps = save_every_n_steps or min(eval_every_n_steps, 500)
+        calculated_save_every_n_steps = save_every_n_steps or min(eval_every_n_steps, 100)
 
         if not checkpointer:
             cfg.checkpointer.save_policy = config_for_function(every_n_steps_and_last_policy).set(
@@ -730,21 +730,30 @@ def get_trainer_config_fn(
                 OrbaxEmergencyCheckpointer.default_config()
             )
             ckpt_config.save_policy = config_for_function(every_n_steps_and_last_policy).set(
-                # n=calculated_save_every_n_steps,
-                # Every 15 minures ore more recommended
-                n=200,
+                n=calculated_save_every_n_steps,
                 max_step=max_step,
             )
             ckpt_config.local_save_policy = config_for_function(every_n_steps_and_last_policy).set(
-                # n=calculated_save_every_n_steps,
-                # Every 2 minutes or more generally recommended
-                n=30,
+                n=calculated_save_every_n_steps,
                 max_step=max_step,
             )
             ckpt_config.local_dir = "/host-tmp/checkpoints"
             ckpt_config.keep_every_n_steps = min(max_step, keep_every_n_steps)
             ckpt_config.keep_last_n = 3
             ckpt_config.replica_axis_index = 1
+            cfg.checkpointer = ckpt_config
+        elif checkpointer == "OrbaxRegularCheckpointer":
+            # Prevent global dependency on Orbax.
+            # pylint: disable-next=import-outside-toplevel
+            from axlearn.common.checkpointer_orbax import OrbaxCheckpointer
+
+            ckpt_config: OrbaxCheckpointer.Config = OrbaxCheckpointer.default_config()
+            ckpt_config.save_policy = config_for_function(every_n_steps_and_last_policy).set(
+                n=calculated_save_every_n_steps,
+                max_step=max_step,
+            )
+            ckpt_config.keep_every_n_steps = min(max_step, keep_every_n_steps)
+            ckpt_config.keep_last_n = 3
             cfg.checkpointer = ckpt_config
 
         cfg.summary_writer.write_every_n_steps = min(eval_every_n_steps, 100)

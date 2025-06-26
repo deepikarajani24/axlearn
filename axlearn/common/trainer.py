@@ -58,6 +58,7 @@ from axlearn.common.utils import (
     canonicalize_per_param_dtype,
     count_model_params,
     flatten_items,
+    host_to_global_specs,
     match_regex_rules,
     thread_stack_traces,
 )
@@ -368,6 +369,8 @@ class SpmdTrainer(Module):
         return self._trainer_state_partition_specs
 
     def _train_step_input_partition_specs(self):
+        # Note that subclasses may override this method to set a partition spec for pjit which is
+        # different from that of the input partition spec.
         return self.input.partition_spec
 
     def model_params_for_eval(self):
@@ -1191,9 +1194,14 @@ class SpmdTrainer(Module):
                     self.trainer_state_specs,
                 )
             if input_batch is None:
-                # Infer input batch shapes from input element spec.
-                # N.B. in a multi-process setting these will be host-local (per process).
-                input_batch = self.input.element_spec()
+                # Infer global input batch shapes from input element spec.
+                host_batch = self.input.element_spec()
+                if "input_dispatcher" in self.input.children:
+                    host_batch = self.input.input_dispatcher.logical_to_physical_shapes(host_batch)
+                input_batch = host_to_global_specs(
+                    host_batch, partition=self._train_step_input_partition_specs()
+                )
+
             # Rely on the instance handle to ensure that we hit the compilation cache if possible.
             jit_train_step = self._jit_train_step or self._pjit_train_step()
             # Note(Jan 2022):

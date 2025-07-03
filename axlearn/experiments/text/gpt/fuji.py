@@ -955,7 +955,6 @@ def trainer_configs(
             model_size, vocab_size=vocab_size, version=version, flash_attention=flash_attention
         )
         max_sequence_length = kwargs.pop("max_sequence_length")
-        checkpointer_str = "OrbaxEmergencyCheckpointer" if use_orbax_emergency_ckpt else ""
         # pylint: disable-next=unexpected-keyword-arg,missing-kwoa
         config_map[config_name] = get_trainer_config_fn(
             train_input_source=train_input_source(

@@ -216,6 +216,7 @@ class OrbaxCheckpointer(BaseCheckpointer):
     def __init__(self, cfg: Config, *, parent: Optional[Module]):
         super().__init__(cfg, parent=parent)
 
+        logging.set_verbosity(logging.DEBUG)
         cfg: OrbaxCheckpointer.Config = self.config
         save_policy = cfg.save_policy.instantiate()
 
@@ -308,6 +309,7 @@ class OrbaxCheckpointer(BaseCheckpointer):
                     # https://orbax.readthedocs.io/en/latest/optimized_checkpointing.html#custom-chunk-sizes
                     # https://orbax.readthedocs.io/en/latest/optimized_checkpointing.html#customizing-data-file-size
                     state=ocp.args.PyTreeSave(item=state),
+                    #state=ocp.args.PyTreeSave(item=state,ocdbt_target_data_file_size=500*1024*1024),
                 ),
             )
             # Exit early after pre-emption, equivalent to sys.exit():

@@ -92,7 +92,7 @@ RUN uv pip install --prerelease=allow .[core,tpu] && uv cache clean
 RUN if [ -n "$EXTRAS" ]; then uv pip install .[$EXTRAS] && uv cache clean; fi
 COPY . .
 # RUN pip install -f --force-reinstall git+https://github.com/google/orbax.git@test_765598157#subdirectory=checkpoint
-RUN pip install -U "orbax-checkpoint==0.11.13"
+# RUN pip install -U "orbax-checkpoint @ git+https://github.com/google/orbax.git@refs/pull/2156/head#subdirectory=checkpoint"
 
 
 ################################################################################

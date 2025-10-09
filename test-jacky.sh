@@ -1,12 +1,15 @@
-# Use this branch exactly - https://github.com/SujeethJinesh/axlearn/pull/1
+export NUM_REPLICAS=2;
 
-export NUM_REPLICAS=128;
+# Set TF log levels
+export TF_CPP_MIN_LOG_LEVEL=0
+export TF_CPP_MAX_VLOG_LEVEL=5
 
+export NAME=deepikarajani-validate-client && export OUTPUT_DIR=gs://axlearn-checkpoint-southamerica-west1/$USER/$NAME && export DATA_DIR=gs://axlearn-southamerica-west1;
+
+export GKE_CLUSTER=$(axlearn gcp config | grep gke_cluster | awk '{ print $3 }' | tr -d '"')
+export PROJECT_ID=$(gcloud config get project)
+export MESH_SELECTOR=${MESH:-"tpu-v6e-256-4"}
 export BASTION_TIER=disabled
-
-export CLUSTER=bodaborg-v6e-256;
-
-export NAME=jackyf-128-orbax-old-2 && export OUTPUT_DIR=gs://tess-checkpoints-flat-us-east5/jackyf/$NAME && export DATA_DIR=gs://tess-dataloading-us-east5/tensorflow_datasets;
 
 axlearn gcp bundle --name=${NAME} \
         --bundler_spec=allow_dirty=True \
@@ -15,19 +18,17 @@ axlearn gcp bundle --name=${NAME} \
         --bundler_spec=image=tpu \
         --bundler_spec=target=tpu;
 
-axlearn gcp launch run --cluster=${CLUSTER} \
+axlearn gcp launch run --cluster=${GKE_CLUSTER} \
         --runner_name=gke_tpu_single \
         --name=${NAME} \
         --instance_type=tpu-v6e-256 \
         --max_tries=100 \
-        --queue=multislice-queue \
-        --priority_class=very-high \
-        --service_account=axlearn-scale-testing \
+        --priority_class=high \
         --num_replicas=$NUM_REPLICAS \
         --bundler_spec=allow_dirty=True \
         --bundler_type=artifactregistry --bundler_spec=image=tpu \
         --bundler_spec=dockerfile=Dockerfile --bundler_spec=target=tpu \
-        -- "ulimit -n 1048576; ulimit -c 0; patch /opt/venv/lib/python3.10/site-packages/jax/experimental/shard_map.py -p0 < patches/shard_map.py.patch; python3 -m axlearn.common.launch_trainer_main \
+        -- "ulimit -n 1048576; ulimit -c 0; patch /opt/venv/lib/python3.10/site-packages/jax/experimental/shard_map.py -p0 < patches/shard_map.py.patch; TF_CPP_MIN_LOG_LEVEL=$TF_CPP_MIN_LOG_LEVEL TF_CPP_MAX_VLOG_LEVEL=$TF_CPP_MAX_VLOG_LEVEL python3 -m axlearn.common.launch_trainer_main \
           --module=text.gpt.c4_trainer \
           --config=fuji-150B-v2-flash \
           --trainer_dir=${OUTPUT_DIR} \

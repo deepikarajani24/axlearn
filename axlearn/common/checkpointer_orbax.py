@@ -202,7 +202,7 @@ class OrbaxCheckpointer(BaseCheckpointer):
         async_timeout_secs: int = 500
         max_concurrent_save_gb: Optional[int] = None
         max_concurrent_restore_gb: Optional[int] = None
-        enable_single_replica_ckpt_restoring: bool = True
+        enable_single_replica_ckpt_restoring: bool = False
         use_replica_parallel: bool = False
 
     @classmethod
@@ -240,7 +240,6 @@ class OrbaxCheckpointer(BaseCheckpointer):
         self._name_format = ocp.step.standard_name_format(
             step_prefix=STEP_PREFIX,
             step_format_fixed_length=STEP_NUM_DIGITS,
-            enable_hns=True,
         )
         self._manager = ocp.CheckpointManager(
             directory=cfg.dir,
@@ -352,7 +351,7 @@ class OrbaxCheckpointer(BaseCheckpointer):
 
         if cfg.enable_single_replica_ckpt_restoring:
             array_handler = ocp.type_handlers.SingleReplicaArrayHandler(
-                replica_axis_index=0,
+                replica_axis_index=1,
                 broadcast_memory_limit_bytes=1024 * 1024 * 1000,  # 1000 MB limit
             )
             ocp.type_handlers.register_type_handler(jax.Array, array_handler, override=True)
@@ -362,7 +361,7 @@ class OrbaxCheckpointer(BaseCheckpointer):
                 if cfg.enable_single_replica_ckpt_restoring:
                     pspec = x.sharding.spec
                     mesh = x.sharding.mesh
-                    replica_axis_index = 0
+                    replica_axis_index = 1
                     replica_devices = _replica_devices(mesh.devices, replica_axis_index)
                     replica_mesh = jax.sharding.Mesh(replica_devices, mesh.axis_names)
                     single_replica_sharding = jax.sharding.NamedSharding(replica_mesh, pspec)
@@ -432,7 +431,7 @@ class OrbaxCheckpointer(BaseCheckpointer):
 
     def stop(self, *, has_exception: bool = False):
         """See `BaseCheckpointer.stop` for details."""
-        self._manager.close()
+        #self._manager.close()
 
 
 def _find_idx(array: np.ndarray, replica_axis_idx: int):

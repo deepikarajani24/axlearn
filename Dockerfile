@@ -42,6 +42,7 @@ FROM base AS ci
 RUN uv pip install .[core,dev,grain,gcp,vertexai_tensorboard,open_api] && uv cache clean
 COPY . .
 
+RUN pip install -f --force-reinstall git+https://github.com/google/orbax.git@refs/pull/2426/head#subdirectory=checkpoint
 # Defaults to an empty string, i.e. run pytest against all files.
 ARG PYTEST_FILES=''
 # Defaults to empty string, i.e. do NOT skip precommit

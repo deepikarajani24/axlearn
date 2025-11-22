@@ -48,7 +48,6 @@ RUN uv pip install -qq .[core,audio,orbax,dev,gcp,vertexai_tensorboard] && \
     uv cache clean
 COPY . .
 
-RUN pip install -f --force-reinstall git+https://github.com/google/orbax.git@refs/pull/2426/head#subdirectory=checkpoint
 # Defaults to an empty string, i.e. run pytest against all files.
 ARG PYTEST_FILES=''
 # Defaults to empty string, i.e. do NOT skip precommit
@@ -100,12 +99,19 @@ ARG INSTALL_PATHWAYS_JAXLIB=false
 # Ensure we install the TPU version, even if building locally.
 # Jax will fallback to CPU when run on a machine without TPU.
 COPY pyproject.toml README.md /root/
+COPY . .
 RUN uv pip install -qq --prerelease=allow .[core,tpu] && uv cache clean
 RUN if [ -n "$EXTRAS" ]; then uv pip install -qq .[$EXTRAS] && uv cache clean; fi
 RUN if [ "$INSTALL_PATHWAYS_JAXLIB" = "true" ]; then \
       uv pip install --prerelease=allow "jaxlib==0.5.3.dev20250918" \
         --find-links https://storage.googleapis.com/axlearn-wheels/wheels.html; \
     fi
+RUN pip uninstall -y orbax-checkpoint  
+RUN pip install git+https://github.com/google/orbax.git@refs/pull/2426/head#subdirectory=checkpoint 
+RUN pip show orbax-checkpoint
+RUN pip uninstall -y tensorflow && \
+  uv pip install --no-deps https://storage.googleapis.com/axlearn-wheels/test/tensorflow_cpu-2.19.1.2-cp310-cp310-linux_x86_64.whl && \
+  uv cache clean
 COPY . .
 
 ################################################################################

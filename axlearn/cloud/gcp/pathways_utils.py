@@ -20,7 +20,12 @@ from axlearn.cloud.gcp.jobset_utils import (
     TPUReplicatedJob,
     _LoadBalancer,
 )
-from axlearn.cloud.gcp.system_characteristics import USER_FACING_NAME_TO_SYSTEM_CHARACTERISTICS
+from axlearn.cloud.gcp.lws_utils import BaseLeaderWorkerTemplate, TPULeaderWorkerTemplate
+from axlearn.cloud.gcp.system_characteristics import (
+    GCE_MACHINE_TYPE_TO_MEMORY_CHARACTERISTICS,
+    USER_FACING_NAME_TO_SYSTEM_CHARACTERISTICS,
+    support_twisted_topology,
+)
 from axlearn.cloud.gcp.tpu import infer_tpu_workers
 from axlearn.cloud.gcp.utils import validate_jobset_name
 from axlearn.common.compiler_options import (
@@ -42,8 +47,9 @@ _PATHWAYS_RESOURCE_MANAGER_PORT = 29001
 _PATHWAYS_WORKER_PORT = 29001
 # Pin to specific pathways image version for stable release.
 # There is no guarantee that this image will work with newer Jax releases.
-# However this image was also tested in Maxtext with Jax 0.6.1.
-_PATHWAYS_IMAGE_TAG = "jax-0.5.3-patch060625"
+# This image version extends GRPC timeout for long context models, based on jax-0.5.3-patch060625
+# This image extends GRPC timeout for long context models.
+_PATHWAYS_IMAGE_TAG = "shm_proxy_settings"
 # The docker image used by pathways proxy container.
 _PATHWAYS_PROXY_IMAGE = (
     f"us-docker.pkg.dev/cloud-tpu-v2-images/pathways/proxy_server:{_PATHWAYS_IMAGE_TAG}"
@@ -57,27 +63,29 @@ _PATHWAYS_RESOURCE_MANAGER_CONTAINER_NAME = "pathways-rm"
 # The container name of pathways proxy.
 _PATHWAYS_PROXY_CONTAINER_NAME = "pathways-proxy"
 # The k8s replicatedJob name for pathways-head pods.
-_PATHWAYS_HEAD_REPLICATED_JOB_NAME = "pathways-head"
+_PATHWAYS_HEAD_REPLICATED_JOB_NAME = "pwhd"
 # The k8s replicatedJob name for pathways-worker pods.
-_PATHWAYS_WORKER_REPLICATED_JOB_NAME = "pathways-worker"
+_PATHWAYS_WORKER_REPLICATED_JOB_NAME = "pwwk"
 
 # Add node-selector for cpu workload to avoid sharing nodes with system services.
 _PATHWAYS_HEAD_NODE_POOL_SELECTOR_KEY = "axlearn/nodepool_type"
 _PATHWAYS_HEAD_NODE_POOL_SELECTOR_VALUE = "workload"
+# The back off limit of pathways pods.
+# Note that the head pod will back of exact this many times.
+# While workers will share #workers * _PATHWAYS_BACK_OFF_LIMIT total times.
+_PATHWAYS_BACK_OFF_LIMIT = 32
 
 
 def parse_xla_flag_value(value: str) -> Union[int, bool, str]:
-    """Attempts to convert an XLA flag string value to int, then bool.
+    """Attempts to convert an XLA flag string value to int.
 
     If conversion fails, returns the original string (stripped).
     """
-    bool_mapper = {"true": True, "false": False}
     stripped_value_str = value.strip()
     try:
         return int(stripped_value_str)
     except ValueError:
-        # Not an integer, try boolean conversion.
-        return bool_mapper.get(stripped_value_str.lower(), stripped_value_str)
+        return stripped_value_str
 
 
 def get_pathways_tpu_version(gke_machine_type: str) -> str:
@@ -87,6 +95,8 @@ def get_pathways_tpu_version(gke_machine_type: str) -> str:
     https://github.com/google/pathways-job/blob/4417de7aa23d3c2316e400a3a327512834374475/internal/controller/pathwaysjob_controller.go#L70-L82
     """
     pathways_tpu_devices = {
+        # 7x
+        "tpu7x-standard-4t": "tpu7x",
         # v6e
         "ct6e-standard-4t": "tpuv6e",
         # v5p
@@ -126,6 +136,26 @@ def get_xla_options(
         A dictionary containing only XLA-specific options (those starting with 'xla').
     """
     return {k: v for k, v in xla_options.items() if k.startswith("xla_")}
+
+
+def round_up_to_power_of_2(n):
+    """
+    Rounds an integer up to the nearest power of 2.
+
+    Args:
+        n (int): The number to round up. Must be a positive integer.
+
+    Returns:
+        int: The smallest power of 2 that is greater than or equal to n.
+
+    Examples:
+        round_up_to_power_of_2(7)   -> 8
+        round_up_to_power_of_2(8)   -> 8
+        round_up_to_power_of_2(9)   -> 16
+        round_up_to_power_of_2(32)  -> 32
+    """
+    assert isinstance(n, int) and n > 0
+    return 1 << (n - 1).bit_length()
 
 
 class PathwaysReplicatedJob(BaseReplicatedJob):
@@ -268,36 +298,17 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
         # In Jax 0.6.2 and beyond this flag can be renamed to
         # IFRT_PROXY_USE_INSECURE_GRPC_CREDENTIALS as well.
         self._update_env_list(env_list, "TEST_UNDECLARED_OUTPUTS_DIR", "true")
-
+        # Threshold for using shared memory between Jax client and Pathways proxy.
+        # Setting it to 1 byte so effectively all Jax device_put use shared memory.
+        self._update_env_list(env_list, "IFRT_PROXY_LARGE_TRANSFER_THRESHOLD", "1")
+        self._update_env_list(
+            env_list, "IFRT_PROXY_LARGE_TRANSFER_OPTIMIZATION_DIRECTORY", "/tmp/ifrt_proxy"
+        )
         env_list.append(
             {
                 "name": "HOST_ADDRESS",
                 "valueFrom": {
                     "fieldRef": {"fieldPath": "metadata.labels['jobset.sigs.k8s.io/coordinator']"}
-                },
-            }
-        )
-
-        # pylint: disable=line-too-long
-        env_list.append(
-            {
-                "name": "NUM_REPLICAS",
-                "valueFrom": {
-                    "fieldRef": {
-                        "fieldPath": "metadata.annotations['jobset.sigs.k8s.io/replicatedjob-replicas']"
-                    }
-                },
-            }
-        )
-        # pylint: enable=line-too-long
-
-        env_list.append(
-            {
-                "name": "REPLICA_ID",
-                "valueFrom": {
-                    "fieldRef": {
-                        "fieldPath": "metadata.annotations['jobset.sigs.k8s.io/job-index']"
-                    }
                 },
             }
         )
@@ -308,9 +319,12 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
         mem_req = f"{self.config.pathways_head_mem}Gi"
         resources = {
             "requests": {"cpu": cpu_req, "memory": mem_req},
-            "limits": {"cpu": cpu_req, "memory": mem_req},
         }
         head_container["resources"] = resources
+
+        volume_mounts = head_container.get("volumeMounts", [])
+        volume_mounts.append(dict(name="shared-memory", mountPath="/tmp/ifrt_proxy"))
+        head_container["volumeMounts"] = volume_mounts
 
         return head_container
 
@@ -340,10 +354,9 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
         ]
         cmd_args.extend(xla_flags_from_options(self._xla_options).split())
 
-        # This is required for GKE Workload Identity and Mac Jax Client support.
-        # TODO(samos123): Remove this once this becomes the default.
-        proxy_env = [{"name": "IFRT_PROXY_USE_INSECURE_GRPC_CREDENTIALS", "value": "true"}]
-
+        instance_type = f"{pathways_tpu_version}:{system.topology}"
+        if support_twisted_topology(self._tpu_type):
+            instance_type = f"{instance_type}_untwisted"
         return [
             dict(
                 name=_PATHWAYS_PROXY_CONTAINER_NAME,
@@ -352,8 +365,21 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
                 # SideCar container is an init container with restartPolicy as "Always".
                 restartPolicy="Always",
                 args=cmd_args,
-                env=proxy_env,
+                env=[
+                    # This is required for GKE Workload Identity and Mac Jax Client support.
+                    # TODO(samos123): Remove this once this becomes the default.
+                    {"name": "IFRT_PROXY_USE_INSECURE_GRPC_CREDENTIALS", "value": "true"},
+                    {"name": "XLA_FLAGS", "value": f"--xla_dump_to=/output/{cfg.name}/xla"},
+                    {
+                        "name": "IFRT_PROXY_LARGE_TRANSFER_OPTIMIZATION_DIRECTORY",
+                        "value": "/tmp/ifrt_proxy",
+                    },
+                ],
                 ports=[dict(containerPort=_PATHWAYS_PROXY_PORT)],
+                volumeMounts=[
+                    dict(name="shared-output", mountPath="/output"),
+                    dict(name="shared-memory", mountPath="/tmp/ifrt_proxy"),
+                ],
             ),
             dict(
                 name=_PATHWAYS_RESOURCE_MANAGER_CONTAINER_NAME,
@@ -371,9 +397,10 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
                     f"--server_port={_PATHWAYS_RESOURCE_MANAGER_PORT}",
                     "--node_type=resource_manager",
                     f"--instance_count={pathways_instance_count}",
-                    f"--instance_type={pathways_tpu_version}:{system.topology}",
+                    f"--instance_type={instance_type}",
                     f"--gcs_scratch_location={staging_location}",
                 ],
+                volumeMounts=[dict(name="shared-output", mountPath="/output")],
             ),
         ]
 
@@ -390,23 +417,23 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
             labels.update({BASTION_JOB_VERSION_LABEL: os.environ.get(BASTION_JOB_VERSION_ENV_VAR)})
 
         volumes.append(dict(name="shared-output", emptyDir={}))
-
         if cfg.gcsfuse_mount:
-            annotations.update(
-                {
-                    "gke-gcsfuse/volumes": "true",
-                    "gke-gcsfuse/cpu-limit": cfg.gcsfuse_mount.cpu,
-                    "gke-gcsfuse/memory-limit": cfg.gcsfuse_mount.memory,
-                    "gke-gcsfuse/ephemeral-storage-limit": cfg.gcsfuse_mount.ephemeral_gb,
-                }
-            )
+            self._inner.set_up_gcsfuse(cfg, volumes, annotations)
+        else:
+            # gcsfuse mounts shared-memory. To avoid double mounting, we only mount
+            # shared-memory explicitly when gcsfuse_mount is not enabled.
+            volumes.append(dict(name="shared-memory", emptyDir=dict(medium="Memory")))
 
         node_selector = {
             _PATHWAYS_HEAD_NODE_POOL_SELECTOR_KEY: _PATHWAYS_HEAD_NODE_POOL_SELECTOR_VALUE,
         }
 
         head_container = self._build_pathways_head_container()
-        init_containers = self._build_pathways_head_sidecar_containers()
+        init_containers = [
+            *self._build_pathways_head_sidecar_containers(),
+            # pylint: disable-next=protected-access
+            self._inner._build_uploader_container(),
+        ]
 
         # Hardcode metadata.google.internal ip address to avoid transient DNS resolution issue.
         metadata_host_alias = dict(
@@ -449,7 +476,7 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
         spec = dict(
             parallelism=1,
             completions=1,
-            backoffLimit=0,
+            backoffLimit=_PATHWAYS_BACK_OFF_LIMIT,
             template=self._build_pathways_head_pod(),
         )
         head_job = dict(
@@ -464,6 +491,8 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
     ) -> dict:
         """Build the container for the 'pathways-worker' role."""
         cfg: TPUReplicatedJob.Config = self._inner.config
+        system = USER_FACING_NAME_TO_SYSTEM_CHARACTERISTICS[self._tpu_type]
+        host_memory = GCE_MACHINE_TYPE_TO_MEMORY_CHARACTERISTICS[system.gce_machine_type]
         # pylint: disable-next=protected-access
         container = self._inner._build_container()
 
@@ -520,6 +549,12 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
             f"--resource_manager_address={pathways_head_address}:"
             + f"{_PATHWAYS_RESOURCE_MANAGER_PORT}",
             f"--gcs_scratch_location={cfg.output_dir}/pathways-staging",
+            # Recycling host memory gives a slight increase in performance.
+            "--tpu_pinned_host_allocation_recycle=true",
+            # The flag below is needed for better H2D performance.
+            # We use 1/4 of the host memory, rounding up to power of 2 as premapped buffer.
+            # Note that pathways worker requires this flag to be a power of 2.
+            f"--tpu_premapped_buffer_size={round_up_to_power_of_2(host_memory//4)*(1<<30)}",
         ]
         mega_scale_args = xla_flags_from_options(self._mxla_options).split()
         worker_container["args"].extend(mega_scale_args)
@@ -605,7 +640,7 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
             # Default value for suspend and resume.
             # References:
             # https://github.com/google/pathways-job/blob/4417de7aa23d3c2316e400a3a327512834374475/internal/controller/pathwaysjob_controller.go#L651
-            backoffLimit=system.vms_per_slice * 4,
+            backoffLimit=system.vms_per_slice * _PATHWAYS_BACK_OFF_LIMIT,
             template=self._build_pathways_worker_pod(pathways_worker_replicated_job_index),
         )
         worker_job = dict(
@@ -709,3 +744,291 @@ class PathwaysMultiheadReplicatedJob(PathwaysReplicatedJob):
             )
 
         return replicated_jobs
+
+
+class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
+    """Builds a LeaderWorkerTemplate spec for TPUs"""
+
+    @config_class
+    class Config(BaseLeaderWorkerTemplate.Config):
+        """Configures PathwaysLeaderWorkerTemplate
+        Attributes:
+            inner: The wrapped TPUReplicatedJob configuration.
+            pathways_head_cpu: CPU request for pathways-head container.
+            pathways_head_mem: Memory request for pathways-head container.
+        """
+
+        inner: Required[TPULeaderWorkerTemplate.Config] = REQUIRED
+        pathways_xla_flags: list[str] = []
+        pathways_head_cpu: Optional[str] = None
+        pathways_head_mem: Optional[str] = None
+
+        target_port: Optional[int] = None
+        enable_service: bool = None
+
+    @classmethod
+    def define_flags(cls, fv):
+        super().define_flags(fv)
+        common_kwargs = dict(flag_values=fv, allow_override=True)
+        # XLA flags and megascale flags have to be passed at jobset creation time.
+        # The XLA flags automatically get passed to the pathways proxy and the
+        # Megascale flags get passed to pathways workers. A single flag is used since
+        # the implementation details could change later.
+        flags.DEFINE_list(
+            "pathways_xla_flags",
+            [],
+            "Set XLA and Megascale flags. Defaults are set by compiler_options.py. "
+            "Example: 'xla_tpu_x=24,megascale_y=true'",
+            **common_kwargs,
+        )
+        flags.DEFINE_string(
+            "pathways_head_cpu",
+            None,
+            "CPU request for pathways-head container in cores. Default is 1 core.",
+            **common_kwargs,
+        )
+        flags.DEFINE_string(
+            "pathways_head_mem",
+            None,
+            "Memory request for pathways-head container in GiB. Default is 16GiB",
+            **common_kwargs,
+        )
+        flags.DEFINE_boolean(
+            "enable_service",
+            False,
+            "Whether to enable creation of service for LWS",
+            **common_kwargs,
+        )
+        flags.DEFINE_integer(
+            "target_port",
+            None,
+            "port where a service can access application, set at head container",
+            **common_kwargs,
+        )
+
+    @classmethod
+    def set_defaults(cls, fv):
+        super().set_defaults(fv)
+        fv.set_default("pathways_head_cpu", fv.pathways_head_cpu or "1")
+        fv.set_default("pathways_head_mem", fv.pathways_head_mem or "16")
+        fv.set_default("target_port", fv.target_port or 9000)
+        fv.set_default("enable_service", fv.enable_service or False)
+
+    @classmethod
+    def default_config(cls):
+        cfg = super().default_config()
+        return cfg.set(inner=TPULeaderWorkerTemplate.default_config())
+
+    def __init__(self, cfg: BaseLeaderWorkerTemplate.Config, *, bundler):
+        super().__init__(cfg, bundler=bundler)
+        cfg: PathwaysLeaderWorkerTemplate.Config = self.config
+
+        self._bundler = bundler
+        self._inner: TPULeaderWorkerTemplate = cfg.inner.instantiate(bundler=self._bundler)
+        self._tpu_type = infer_tpu_type(cfg.inner.accelerator.instance_type)
+        if self._tpu_type not in USER_FACING_NAME_TO_SYSTEM_CHARACTERISTICS:
+            raise NotImplementedError(f"Missing system characteristics for {self._tpu_type}")
+
+    def _build_pathways_worker_container(self) -> dict:
+        cfg: TPULeaderWorkerTemplate.Config = self.config
+        # pylint: disable-next=protected-access
+        container = self._inner._build_container()
+
+        worker_container = copy.deepcopy(container)
+        args = [
+            f"--server_port={_PATHWAYS_WORKER_PORT}",
+            "--resource_manager_address=$(LWS_LEADER_ADDRESS):"
+            + f"{_PATHWAYS_RESOURCE_MANAGER_PORT}",
+            f"--gcs_scratch_location={cfg.output_dir}/pathways-staging",
+        ]
+        worker_container["args"] = args
+        ports = worker_container.get("ports", [])
+        ports.append({"containerPort": _PATHWAYS_WORKER_PORT})
+        worker_container["ports"] = ports
+        worker_container["image"] = _PATHWAYS_SERVER_IMAGE
+
+        worker_container.pop("command")
+        return worker_container
+
+    def build_worker_pod(self) -> dict:
+        # pylint: disable-next=protected-access
+        cfg: TPULeaderWorkerTemplate.Config = self._inner.config
+        # pylint: disable-next=protected-access
+        pod = self._inner._build_pod()
+        worker_pod = copy.deepcopy(pod)
+
+        pod_spec = worker_pod.get("spec", {})
+        pod_spec.pop("restartPolicy")
+        pod_spec["HostNetwork"] = True
+        pod_spec["dnsPolicy"] = "ClusterFirstWithHostNet"
+        pod_spec["containers"] = [self._build_pathways_worker_container()]
+        worker_pod["spec"] = pod_spec
+
+        # Service account for nodes.
+        if cfg.service_account:
+            metadata = worker_pod.get("metadata", {})
+            annotations = metadata.get("annotations", {})
+            node_service_account = f"{cfg.service_account}@{cfg.project}.iam.gserviceaccount.com"
+            annotations.update(
+                {
+                    _ANNOTATION_NODE_SERVICE_ACCOUNT: node_service_account,
+                }
+            )
+            worker_pod["metadata"]["annotations"] = annotations
+
+        return worker_pod
+
+    def _build_pathways_proxy_container(self) -> dict:
+        cfg: TPULeaderWorkerTemplate.Config = self._inner.config
+        staging_location = f"{cfg.output_dir}/pathways-staging"
+
+        return dict(
+            name=_PATHWAYS_PROXY_CONTAINER_NAME,
+            image=_PATHWAYS_PROXY_IMAGE,
+            args=[
+                f"--resource_manager_address=localhost:{_PATHWAYS_RESOURCE_MANAGER_PORT}",
+                f"--server_port={_PATHWAYS_PROXY_PORT}",
+                f"--gcs_scratch_location={staging_location}",
+            ],
+            env=[{"name": "IFRT_PROXY_USE_INSECURE_GRPC_CREDENTIALS", "value": "true"}],
+            ports=[dict(containerPort=_PATHWAYS_PROXY_PORT)],
+        )
+
+    def _build_pathways_rm_container(self) -> dict:
+        cfg: TPULeaderWorkerTemplate.Config = self._inner.config
+        staging_location = f"{cfg.output_dir}/pathways-staging"
+
+        system = USER_FACING_NAME_TO_SYSTEM_CHARACTERISTICS[self._tpu_type]
+        pathways_tpu_version = get_pathways_tpu_version(system.gce_machine_type)
+
+        return dict(
+            name=_PATHWAYS_RESOURCE_MANAGER_CONTAINER_NAME,
+            image=_PATHWAYS_SERVER_IMAGE,
+            env=[
+                {
+                    "name": "TPU_SKIP_MDS_QUERY",
+                    "value": "true",
+                },
+                {
+                    "name": "HOST_ADDRESS",
+                    "value": "$(LWS_LEADER_ADDRESS)",
+                },
+            ],
+            args=[
+                f"--server_port={_PATHWAYS_RESOURCE_MANAGER_PORT}",
+                "--node_type=resource_manager",
+                "--instance_count=1",
+                f"--instance_type={pathways_tpu_version}:{system.topology}",
+                f"--gcs_scratch_location={staging_location}",
+            ],
+            ports=[dict(containerPort=_PATHWAYS_RESOURCE_MANAGER_PORT)],
+        )
+
+    def _build_head_container(self) -> dict:
+        cfg: TPULeaderWorkerTemplate.Config = self._inner.config
+        cpu_req = f"{float(self.config.pathways_head_cpu) * 1000}m"
+        mem_req = f"{self.config.pathways_head_mem}Gi"
+        resources = {
+            "requests": {"cpu": cpu_req, "memory": mem_req},
+            "limits": {"cpu": cpu_req, "memory": mem_req},
+        }
+        return dict(
+            name=cfg.name,
+            image=cfg.image_id or self._bundler.id(cfg.name),
+            command=["bash", "-c", cfg.command],
+            env=[
+                {
+                    "name": "XCLOUD_ENVIRONMENT",
+                    "value": "GCP",
+                },
+                {
+                    "name": "JAX_PLATFORMS",
+                    "value": "proxy",
+                },
+                {
+                    "name": "JAX_BACKEND_TARGET",
+                    "value": f"grpc://$(LWS_LEADER_ADDRESS):{_PATHWAYS_PROXY_PORT}",
+                },
+                {
+                    "name": "TEST_UNDECLARED_OUTPUTS_DIR",
+                    "value": "true",
+                },
+            ],
+            imagePullPolicy="Always",
+            resources=resources,
+            ports=[dict(containerPort=self.config.target_port)]
+            if self.config.enable_service
+            else [],
+        )
+
+    def build_leader_pod(self) -> Nested[Any]:
+        # pylint: disable-next=protected-access
+        cfg: TPUReplicatedJob.Config = self._inner.config
+
+        annotations, labels, volumes, tolerations = {}, {}, [], []
+
+        if os.environ.get(BASTION_JOB_VERSION_ENV_VAR):
+            labels.update({BASTION_JOB_VERSION_LABEL: os.environ.get(BASTION_JOB_VERSION_ENV_VAR)})
+
+        volumes.append(dict(name="shared-output", emptyDir={}))
+        labels = {"app": cfg.name}
+
+        if cfg.gcsfuse_mount:
+            annotations.update(
+                {
+                    "gke-gcsfuse/volumes": "true",
+                    "gke-gcsfuse/cpu-limit": cfg.gcsfuse_mount.cpu,
+                    "gke-gcsfuse/memory-limit": cfg.gcsfuse_mount.memory,
+                    "gke-gcsfuse/ephemeral-storage-limit": cfg.gcsfuse_mount.ephemeral_gb,
+                }
+            )
+
+        node_selector = {
+            _PATHWAYS_HEAD_NODE_POOL_SELECTOR_KEY: _PATHWAYS_HEAD_NODE_POOL_SELECTOR_VALUE,
+        }
+
+        containers = [
+            self._build_head_container(),
+            self._build_pathways_proxy_container(),
+            self._build_pathways_rm_container(),
+        ]
+
+        metadata_host_alias = dict(
+            ip=_METADATA_GOOGLE_INTERNAL_IP,
+            hostnames=["metadata", "metadata.google.internal"],
+        )
+
+        leader_pod_spec = {
+            "terminationGracePeriodSeconds": 60,
+            "hostAliases": [metadata_host_alias],
+            "nodeSelector": node_selector,
+            "tolerations": tolerations,
+            "containers": containers,
+            "volumes": volumes,
+            "serviceAccountName": cfg.service_account,
+            "hostNetwork": True,
+            "dnsPolicy": "ClusterFirstWithHostNet",
+        }
+
+        if cfg.priority_class:
+            leader_pod_spec["priorityClassName"] = cfg.priority_class
+
+        return {
+            "metadata": {
+                "annotations": annotations,
+                "labels": labels,
+            },
+            "spec": leader_pod_spec,
+        }
+
+    def __call__(self) -> Nested[Any]:
+        system = USER_FACING_NAME_TO_SYSTEM_CHARACTERISTICS[self._tpu_type]
+        return dict(
+            subGroupPolicy=dict(
+                subGroupSize=system.vms_per_slice,
+                subGroupPolicyType="LeaderExcluded",
+            ),
+            size=system.vms_per_slice + 1,
+            leaderTemplate=self.build_leader_pod(),
+            workerTemplate=self.build_worker_pod(),
+        )

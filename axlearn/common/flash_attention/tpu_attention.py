@@ -2,13 +2,13 @@
 
 """Wrappers for FlashAttention on TPU in JAX with logit bias support."""
 import functools
+import logging
 from typing import Optional
 
 import jax
 import jax.ad_checkpoint
 import jax.numpy as jnp
 import numpy as np
-from absl import logging
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
@@ -46,6 +46,7 @@ from axlearn.common.flash_attention.common import (
     repeat_kv_heads,
 )
 from axlearn.common.flash_attention.remat import FLASH_ATTN_RESIDUAL_NAME
+from axlearn.common.kv_cache.base_kv_cache import BaseKVCache
 from axlearn.common.utils import Nested, Tensor
 
 MaskFnOrZero = MaskFnAttentionBias | ZeroAttentionBias
@@ -71,7 +72,7 @@ def _to_splash_mask(
 
     # Because mask.mask() may use jnp ops. e.g. jnp.logical_and.
     with jax.ensure_compile_time_eval():
-        # This code is reached only when `is_decoding == False` (i.e., forward and prefill) and
+        # This code is reached only when `kv_cache_type=None` (i.e., forward and prefill) and
         # `target_len == source_len` (i.e., self-attention) (see `check_tpu_splash_attention`).
         # `target_positions` and `source_positions` are always in the range [0, seq_len].
         target_positions = np.arange(mask_shape[0])[None, :, None]
@@ -440,14 +441,12 @@ def _flash_attention_impl(
         out_shape=out_shape,
         debug=debug,
         interpret=interpret,
-        compiler_params=dict(
-            mosaic=dict(
-                dimension_semantics=(
-                    "parallel",
-                    "parallel",
-                    "parallel",
-                    "arbitrary",
-                )
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=(
+                "parallel",
+                "parallel",
+                "parallel",
+                "arbitrary",
             )
         ),
     )(q, k, v, ab, q_segment_ids, kv_segment_ids)
@@ -648,14 +647,12 @@ def _flash_attention_bwd_dkv(
             out_shape=out_shapes,
             debug=debug,
             interpret=interpret,
-            compiler_params=dict(
-                mosaic=dict(
-                    dimension_semantics=(
-                        "parallel",
-                        "parallel",
-                        "parallel",
-                        "arbitrary",
-                    )
+            compiler_params=pltpu.CompilerParams(
+                dimension_semantics=(
+                    "parallel",
+                    "parallel",
+                    "parallel",
+                    "arbitrary",
                 )
             ),
         )(q, k, v, ab, q_segment_ids, kv_segment_ids, l, m, do, di)
@@ -841,14 +838,12 @@ def _flash_attention_bwd_dq(
             out_shape=out_shapes,
             debug=debug,
             interpret=interpret,
-            compiler_params=dict(
-                mosaic=dict(
-                    dimension_semantics=(
-                        "parallel",
-                        "parallel",
-                        "parallel",
-                        "arbitrary",
-                    )
+            compiler_params=pltpu.CompilerParams(
+                dimension_semantics=(
+                    "parallel",
+                    "parallel",
+                    "parallel",
+                    "arbitrary",
                 )
             ),
         )(q, k, v, ab, q_segment_ids, kv_segment_ids, l, m, do, di)
@@ -863,23 +858,14 @@ class TPUFlashAttention(BaseFlashAttention):
     def is_supported(
         self,
         input_batch: Nested[Tensor | BaseAttentionBias],
+        kv_cache_type: Optional[type[BaseKVCache]],
     ) -> bool:
         """See `BaseFlashAttention.is_supported`."""
-        if not super().is_supported(
-            input_batch=input_batch,
-        ):
+        if not super().is_supported(input_batch=input_batch, kv_cache_type=kv_cache_type):
             return False
         block_size = self.cfg.tpu_block_size
         if not self._check_block_size(input_batch=input_batch, block_size=block_size):
             return False
-        query: Tensor = input_batch["query"]
-        if jax.config.jax_default_matmul_precision == "highest" and query.dtype == jnp.bfloat16:
-            # Pallas is having some trouble compiling bfloat with precision default is the highest
-            # precision.
-            raise ValueError(
-                "TPU FlashAttention doesn't support default_matmul_precision=='highest' "
-                "when the query dtype is bfloat16!"
-            )
         return True
 
 
@@ -893,26 +879,58 @@ class TPUSplashAttention(TPUFlashAttention):
     In these two cases, we fallback to the legacy implementation.
     """
 
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        self._use_fused = True
+
     def is_supported(
         self,
         input_batch: Nested[Tensor | BaseAttentionBias],
+        kv_cache_type: Optional[type[BaseKVCache]],
     ) -> bool:
         """See `BaseFlashAttention.is_supported`."""
-        if not super().is_supported(input_batch):
+        if not super().is_supported(input_batch, kv_cache_type=kv_cache_type):
             return False
         bias: BaseAttentionBias = input_batch["bias"]
         _, _, explicit_bias = split(bias, MaskFnAttentionBias, SegmentIdAttentionBias)
-        query: Tensor = input_batch["query"]
-        head_dim = query.shape[-1]
 
         if explicit_bias.has_value():
             return self._log_unsupported("explicit bias is not supported.")
 
-        if head_dim % splash_attention_kernel.NUM_LANES != 0:
-            return self._log_unsupported(
-                f"{head_dim=} is not divisible by {splash_attention_kernel.NUM_LANES=}"
-            )
-        logging.info("Using %s.", self.name())
+        if (
+            not self.get_backend_overrides("splash_use_fused_bwd_kernel", True)
+            and self.cfg.dropout_rate > 0.0
+        ):
+            # TODO (bailin): Support dropout with non-fused bwd kernel.
+            return self._log_unsupported("dropout with non-fused bwd kernel is not supported.")
+
+        # If user doesn't specify splash_use_fused_bwd_kernel, we have some defaults
+        # or heuristics to decide whether to use fused bwd kernel.
+        if (
+            not self.cfg.backend_overrides
+            or "splash_use_fused_bwd_kernel" not in self.cfg.backend_overrides
+        ):
+            # When dropout is enabled, we always use the fused bwd kernel.
+            if self.cfg.dropout_rate > 0.0:
+                self._use_fused = True
+            else:
+                # Heuristic for sliding window attention.
+                sliding, _ = split(bias, SlidingWindowAttentionBias)
+                key: Tensor = input_batch["key"]
+                kv_seq_len = key.shape[1]
+                # TODO(c_lan): Support logit_sinks for non-fused bwd kernel.
+                if sliding.has_value() and "logit_sinks" not in input_batch:
+                    if kv_seq_len >= 16 * 1024 and kv_seq_len / sliding.sliding_window_size >= 4.0:
+                        logging.info(
+                            "Not using fused kernel for splash attention backward pass for better "
+                            "performance, because sliding_window_size=%d << kv_seq_len=%d.",
+                            sliding.sliding_window_size,
+                            kv_seq_len,
+                        )
+                        self._use_fused = False
+        else:
+            self._use_fused = self.get_backend_overrides("splash_use_fused_bwd_kernel", True)
+
         return True
 
     @functools.partial(jax.jit, static_argnames=["self"])
@@ -926,6 +944,7 @@ class TPUSplashAttention(TPUFlashAttention):
         query: Tensor = input_batch["query"]
         key: Tensor = input_batch["key"]
         value: Tensor = input_batch["value"]
+        logit_sink: Optional[Tensor] = input_batch.get("logit_sink", None)
         prng_key = input_batch.get("prng_key", None)
 
         if cfg.dropout_rate > 0.0 and prng_key is None:
@@ -946,18 +965,40 @@ class TPUSplashAttention(TPUFlashAttention):
 
         block_size = self.cfg.tpu_block_size
         block_sizes = splash_attention_kernel.BlockSizes(
-            block_q=block_size,
-            block_kv=block_size,
-            block_kv_compute=block_size,
-            block_q_dkv=block_size,
-            block_kv_dkv=block_size,
-            block_kv_dkv_compute=block_size,
+            block_q=self.get_backend_overrides("splash_block_q", block_size),
+            block_kv=self.get_backend_overrides("splash_block_kv", block_size),
+            block_kv_compute=self.get_backend_overrides("splash_block_kv_compute", block_size),
+            # When fused bwd kernel is used, dq and dk/dv are computed in the same kernel. Only
+            # *dkv* block sizes are used. When fused bwd kernel is not used, dk and dv are computed
+            # in one kernel using *dkv* block sizes, and dq is computed in another kernel using *dq
+            # block sizes.
+            block_q_dkv=self.get_backend_overrides("splash_block_q_dkv", block_size),
+            block_kv_dkv=self.get_backend_overrides("splash_block_kv_dkv", block_size),
+            block_kv_dkv_compute=self.get_backend_overrides(
+                "splash_block_kv_dkv_compute", block_size
+            ),
+            block_q_dq=(
+                None
+                if self._use_fused
+                else self.get_backend_overrides("splash_block_q_dq", block_size)
+            ),
+            block_kv_dq=(
+                None
+                if self._use_fused
+                else self.get_backend_overrides("splash_block_kv_dq", block_size)
+            ),
             # The fused kernel is neutral in small models and a ~5%-15% improvement in larger ones.
             # E.g., 1.03x speedup in a 12.6b simulated model, 1.06x speedup in 29.6b ,
             # and 1.14x in 539.5b.
-            use_fused_bwd_kernel=True,
+            # NOTE(hanzhi-zhou): Fused bwd kernel may require more memory usage because it needs to
+            # keep a temporary unreduced dq tensor of shape (kv_seq_len // block_kv_dkv, *q.shape)
+            # in HBM. If memory usage is a problem, consider increasing block_kv_dkv or disabling
+            # fused kernel.
+            use_fused_bwd_kernel=self._use_fused,
         )
-        splash_mask = _to_splash_mask(mask, mask_shape=(query.shape[2], key.shape[2]))
+        splash_mask = _to_splash_mask(
+            mask, mask_shape=(query.shape[2], key.shape[2]), q_seq_shards=1
+        )
 
         num_heads = query.shape[1]
         mha_mask = splash_attention_mask.MultiHeadMask(masks=[splash_mask] * num_heads)
@@ -973,7 +1014,7 @@ class TPUSplashAttention(TPUFlashAttention):
             interpret=self.cfg.interpret,
             residual_checkpoint_name=f"tpu_attention.{FLASH_ATTN_RESIDUAL_NAME}",
         )
-        p_kernel = functools.partial(kernel, prng_key=prng_key)
+        p_kernel = functools.partial(kernel, prng_key=prng_key, logit_sink=logit_sink)
         vp_kernel = jax.vmap(p_kernel, axis_name="batch")
         context = vp_kernel(q=query, k=key, v=value, segment_ids=seg_ids)
         return jnp.einsum("bnth->btnh", context)
@@ -1001,13 +1042,25 @@ class TPUSplashAttention(TPUFlashAttention):
 
         block_size = self.cfg.tpu_block_size
         block_sizes = splash_attention_kernel.BlockSizes(
-            block_q=block_size,
-            block_kv=block_size,
-            block_kv_compute=block_size,
-            block_q_dkv=block_size,
-            block_kv_dkv=block_size,
-            block_kv_dkv_compute=block_size,
-            use_fused_bwd_kernel=True,
+            block_q=self.get_backend_overrides("splash_block_q", block_size),
+            block_kv=self.get_backend_overrides("splash_block_kv", block_size),
+            block_kv_compute=self.get_backend_overrides("splash_block_kv_compute", block_size),
+            block_q_dkv=self.get_backend_overrides("splash_block_q_dkv", block_size),
+            block_kv_dkv=self.get_backend_overrides("splash_block_kv_dkv", block_size),
+            block_kv_dkv_compute=self.get_backend_overrides(
+                "splash_block_kv_dkv_compute", block_size
+            ),
+            block_q_dq=(
+                None
+                if self._use_fused
+                else self.get_backend_overrides("splash_block_q_dq", block_size)
+            ),
+            block_kv_dq=(
+                None
+                if self._use_fused
+                else self.get_backend_overrides("splash_block_kv_dq", block_size)
+            ),
+            use_fused_bwd_kernel=self._use_fused,
         )
 
         kernel = functools.partial(
@@ -1027,9 +1080,10 @@ class LegacyTPUFlashAttention(TPUFlashAttention):
     def is_supported(
         self,
         input_batch: Nested[Tensor | BaseAttentionBias],
+        kv_cache_type: Optional[type[BaseKVCache]],
     ) -> bool:
         """See `BaseFlashAttention.is_supported`."""
-        if not super().is_supported(input_batch):
+        if not super().is_supported(input_batch, kv_cache_type=kv_cache_type):
             return False
         query: Tensor = input_batch["query"]
         key: Tensor = input_batch["key"]
@@ -1037,7 +1091,16 @@ class LegacyTPUFlashAttention(TPUFlashAttention):
             return self._log_unsupported(f"{query.dtype=} != {key.dtype=}")
         if self.cfg.dropout_rate != 0.0:
             return self._log_unsupported("dropout is not supported.")
-        logging.info("Using %s.", self.name())
+        logit_sink = input_batch.get("logit_sink", None)
+        if logit_sink is not None:
+            return self._log_unsupported("LegacyTPUFlashAttention doesn't support logit sink.")
+        if jax.config.jax_default_matmul_precision == "highest" and query.dtype == jnp.bfloat16:
+            # Pallas is having some trouble compiling bfloat16 with highest default
+            # precision.
+            return self._log_unsupported(
+                "LegacyTPUFlashAttention doesn't support default_matmul_precision=='highest' "
+                "when the query dtype is bfloat16."
+            )
         return True
 
     @functools.partial(jax.jit, static_argnames=["self"])

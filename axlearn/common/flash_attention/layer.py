@@ -3,21 +3,23 @@
 """FlashAttention layers."""
 
 from collections.abc import Sequence
-from typing import Optional, cast
+from typing import Any, Optional, cast
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from absl import logging
 from jax.experimental.shard_map import shard_map
 from jax.interpreters.pxla import thread_resources
 from jax.sharding import PartitionSpec
 
 from axlearn.common.attention import Dropout, ForwardMode, GroupedQueryAttention, KVState
 from axlearn.common.attention_bias import BaseAttentionBias
+from axlearn.common.base_layer import ParameterSpec
 from axlearn.common.config import ConfigBase, ConfigModifier, config_class
 from axlearn.common.flash_attention.utils import flash_attention_implementation
 from axlearn.common.module import Module
-from axlearn.common.utils import Tensor, with_sharding_constraint
+from axlearn.common.utils import Tensor, maybe_shard, with_sharding_constraint
 
 
 class FlashAttention(GroupedQueryAttention):
@@ -60,6 +62,10 @@ class FlashAttention(GroupedQueryAttention):
         # How to partition output values, keyed by dims.
         output_dim_to_partition_spec: dict[str, Optional[PartitionSpec]] = {}
 
+        # Backend specific config overrides.
+        # TODO(hanzhi-zhou): Unify tpu_block_size and gpu_block_size with backend_overrides.
+        backend_overrides: Optional[dict[str, Any]] = None
+
     def __init__(self, cfg: Config, *, parent: Module):
         super().__init__(cfg, parent=parent)
         cfg = self.config
@@ -74,7 +80,20 @@ class FlashAttention(GroupedQueryAttention):
                 f"{type(self.dropout).__module__}.{type(self.dropout).__qualname__}"
             )
         if cfg.tpu_block_size % 128 != 0:
-            raise ValueError("cfg.tpu_block_size must divide 128.")
+            raise ValueError("cfg.tpu_block_size must be divisible by 128.")
+
+    def _create_layer_parameter_specs(self) -> dict[str, ParameterSpec]:
+        cfg = self.config
+        params = super()._create_layer_parameter_specs()
+
+        # Derive the mesh_axes for sink parameters from mha_dim_to_partition_spec.
+        if cfg.logit_sink:
+            if len(cfg.mha_dim_to_partition_spec["bsnh"]) < 3:
+                params["sink"].mesh_axes = (None,)
+            else:
+                params["sink"].mesh_axes = (cfg.mha_dim_to_partition_spec["bsnh"][2],)
+
+        return params
 
     @classmethod
     def default_config(cls) -> Config:
@@ -108,7 +127,7 @@ class FlashAttention(GroupedQueryAttention):
 
     def _maybe_repeat_kv_heads(self, key_or_value: Tensor) -> Tensor:
         """Repeats key or value heads dim to be shardable."""
-        cfg = self.config
+        cfg: FlashAttention.Config = self.config
         partition_spec = cfg.mha_dim_to_partition_spec["bsnh"]
         global_mesh = thread_resources.env.physical_mesh
         if (
@@ -132,7 +151,24 @@ class FlashAttention(GroupedQueryAttention):
         num_head_repeats = axis_size // key_or_value.shape[-2]
         # Repeat along the num_heads dim: [batch, source_length, repeated_num_heads, per_head_dim].
         if num_head_repeats > 1:
+            logging.info(
+                "Repeating %d KV heads %d times to meet the size of %s, which is %d.",
+                key_or_value.shape[-2],
+                num_head_repeats,
+                axis,
+                axis_size,
+            )
             key_or_value = jnp.repeat(key_or_value, num_head_repeats, axis=-2)
+            if cfg.k_partition_spec != cfg.v_partition_spec:
+                raise ValueError(
+                    "FlashAttention doesn't support "
+                    f"{cfg.k_partition_spec=} != {cfg.v_partition_spec}"
+                )
+            # This maybe_shard is required when using "seq" > num_kv_heads and DeepSpeed Ulysses
+            # style sequence parallelism. It tells the compiler to not reshard from partitioning
+            # along the sequence axis to head axis before the `jnp.repeat` above, which otherwise
+            # would cause an involuntary full materialization.
+            key_or_value = maybe_shard(key_or_value, cfg.k_partition_spec or cfg.q_partition_spec)
 
         if key_or_value.shape[-2] % axis_size != 0:
             raise ValueError(
@@ -179,24 +215,26 @@ class FlashAttention(GroupedQueryAttention):
             v_proj = self._maybe_repeat_kv_heads(v_proj)
         attention_logit_biases = attention_logit_biases.astype(q_proj.dtype)
 
-        # Note: prefill (INIT_STATE) is not is_decoding because query and key have the same shape.
-        # Note: this is a heuristic and it is possible (although not currently common) to do
-        # an extend_step even if we aren't in decoding. A more robust method could instead directly
-        # look at whether we need gradients or not, which could be done by adding a custom_vjp.
-        is_decoding = mode == ForwardMode.EXTEND_STEP
+        kv_cache_type = self._get_kv_cache_type(mode)
+
+        # Get logit sink parameter if configured.
+        logit_sink = self.parameters.get("sink", None)
+
         jit_attn = flash_attention_implementation(
             backend=backend,
             query=q_proj,
             key=k_proj,
             value=v_proj,
             bias=attention_logit_biases,
+            logit_sink=logit_sink,
             softmax_scale=1.0,
-            is_decoding=is_decoding,
+            kv_cache_type=kv_cache_type,
             # TODO(hanzhi-zhou): Refactor backend specific config passing.
             tpu_block_size=cfg.tpu_block_size,
             gpu_block_size=cfg.gpu_block_size or 128,
-            dropout_rate=cfg.dropout.rate,
+            dropout_rate=cfg.dropout.rate if self.is_training else 0.0,
             page_tables=page_indices,
+            backend_overrides=cfg.backend_overrides,
         )
         if jit_attn is None:
             # Fall back to standard attention if no backend kernels are supported.
@@ -239,6 +277,12 @@ class FlashAttention(GroupedQueryAttention):
             "prng_key": PartitionSpec(None),
             # Bias that can broadcast to [batch_size, num_heads, seq_len, seq_len].
             "bias": attention_logit_biases_spec,
+            # Logit sink values of shape [num_heads].
+            "logit_sink": (
+                PartitionSpec(None)
+                if logit_sink is None or len(cfg.mha_dim_to_partition_spec["bsnh"]) < 3
+                else PartitionSpec(cfg.mha_dim_to_partition_spec["bsnh"][2])
+            ),
             # PagedKVCache's page indices.
             "page_tables": cfg.mha_dim_to_partition_spec.get("bs", PartitionSpec(None)),
         }
@@ -261,6 +305,7 @@ class FlashAttention(GroupedQueryAttention):
             "value": v_proj,
             "prng_key": self.dropout.get_prng_key(),
             "bias": attention_logit_biases,
+            "logit_sink": logit_sink,
             "page_tables": page_indices,
         }
         outputs = with_sharding_constraint(
@@ -276,6 +321,14 @@ class FlashAttention(GroupedQueryAttention):
             cfg.output_dim_to_partition_spec["bnts"],
         )
         return outputs, output_probs
+
+    def _get_kv_cache_type(self, mode: ForwardMode):
+        # Note: prefill (INIT_STATE) is not decoding because query and key have the same shape.
+        # Note: this is a heuristic and it is possible (although not currently common) to do
+        # an extend_step even if we aren't in decoding. A more robust method could instead directly
+        # look at whether we need gradients or not, which could be done by adding a custom_vjp.
+        is_decoding = mode == ForwardMode.EXTEND_STEP
+        return type(self.kv_cache) if is_decoding else None
 
 
 def default_mha_dim_to_partition_spec(
@@ -347,6 +400,41 @@ class FlashBlockSizeModifier(ConfigModifier):
                 value = cast(FlashAttention.Config, value)
                 value.tpu_block_size = tpu_block_size
                 value.gpu_block_size = gpu_block_size
+
+        def enter_fn(_, value, default_kv):
+            return None if is_flash_config(value) else default_kv
+
+        cfg.visit(visit_fn=visit_fn, enter_fn=enter_fn)
+        return cfg
+
+
+class BackendOverrideModifier(ConfigModifier):
+    """Modifies the backend_overrides config of Flash Attention."""
+
+    @config_class
+    class Config(ConfigModifier.Config):
+        """Configures BackendOverrideModifier."""
+
+        backend_overrides: Optional[dict[str, Any]] = None
+
+    def __call__(self, cfg: ConfigBase) -> ConfigBase:
+        backend_overrides = self.config.backend_overrides
+
+        def is_flash_config(cfg):
+            return isinstance(cfg, FlashAttention.Config)
+
+        def visit_fn(_, value):
+            if is_flash_config(value):
+                value = cast(FlashAttention.Config, value)
+                if backend_overrides:
+                    # Instantiate a dict if value.backend_overrides hasn't already been set
+                    if value.backend_overrides is None:
+                        value.backend_overrides = dict()
+                    for override_key, override_value in backend_overrides.items():
+                        # Ensure we don't insert any values equal to None
+                        if override_value:
+                            # Use .update() to avoid overwriting existing overrides
+                            value.backend_overrides.update({override_key: override_value})
 
         def enter_fn(_, value, default_kv):
             return None if is_flash_config(value) else default_kv

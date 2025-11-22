@@ -306,6 +306,10 @@ class BaseDockerBundler(Bundler):
         super().__init__(cfg)
         cfg = self.config
 
+        if cfg.skip_bundle:
+            # No need to check other fields if skip bundle
+            return
+
         if not cfg.image:
             raise ValueError(
                 "image cannot be empty. Please provide one via --bundler_spec=image=my-image."
@@ -625,12 +629,12 @@ class BaseTarBundler(Bundler):
         )
         pip_install_cmd = (
             f"if [[ -f {config.CONFIG_DIR}/requirements.txt ]]; then "
-            f"python3 -m pip install -r {config.CONFIG_DIR}/requirements.txt; "
-            "else python3 -m pip install .; fi"
+            f"python3 -m uv pip install -r {config.CONFIG_DIR}/requirements.txt; "
+            "else python3 -m uv pip install .; fi"
         )
         return (
             f"{copy_cmd} && tar -xzf axlearn.tar.gz && "
-            f"python3 -m pip install --upgrade pip && {pip_install_cmd}"
+            f"python3 -m uv pip install --upgrade pip && {pip_install_cmd}"
         )
 
 

@@ -217,6 +217,10 @@ class SpmdTrainer(Module):
         # Defaults to None which is interpreted as True.
         cache_compiled_train_step: Optional[bool] = None
 
+        # Log the loss value every n steps. Defaults to None which is interpreted as every
+        # 100 steps.
+        log_every_n_steps: Optional[int] = None
+
     def __init__(
         self,
         cfg: Config,
@@ -389,7 +393,10 @@ class SpmdTrainer(Module):
 
     def model_params_for_eval(self):
         state = self.trainer_state
-        if self.config.learner.ema.decay is not None:
+        # Note: It's important to use self._config, not self.config, here because this method
+        # can get called multiple times per training step (especially if there are many evalers)
+        # and self.config does an expensive deep copy.
+        if self._config.learner.ema.decay is not None:
             logging.log_first_n(logging.INFO, "Using model parameter EMA for eval", 10)
             return state.learner["ema"].ema
         return state.model
@@ -539,6 +546,17 @@ class SpmdTrainer(Module):
             )
         return force_run_evals
 
+    def _maybe_record_event(self, event: measurement.Event, *args, **kwargs):
+        if self._recorder is not None:
+            self._recorder.record(event, *args, **kwargs)
+
+    def _maybe_monitor_all(self):
+        return (
+            self._recorder.maybe_monitor_all()
+            if self._recorder is not None
+            else contextlib.nullcontext()
+        )
+
     # pylint: disable-next=too-many-statements,too-many-branches
     def run(
         self, prng_key: Tensor, *, return_evaler_summaries: Optional[Union[bool, set[str]]] = None
@@ -575,7 +593,7 @@ class SpmdTrainer(Module):
             self.mesh(),
             jax.log_compiles(self.vlog_is_on(1)),
             self._context_manager(),
-            self._recorder.maybe_monitor_all_goodput(),
+            self._maybe_monitor_all(),
         ):
             cfg = self.config
             # Check if need to force run evals at the last training step.
@@ -1048,6 +1066,7 @@ class SpmdTrainer(Module):
         options = infer_xla_performance_flags(
             mesh_shape=cfg.mesh_shape, mesh_axis_names=cfg.mesh_axis_names, device_kind=device_kind
         )
+        logging.log_first_n(logging.INFO, "Compiler options: %s", 1, options)
         if not with_xsc:
             with self._record_event(
                 measurement.Event.CUSTOM_BADPUT_EVENT,
@@ -1099,7 +1118,8 @@ class SpmdTrainer(Module):
             # Run the compiled function.
             self._trainer_state, outputs = compiled_train_step_fn(self.trainer_state, input_batch)
 
-        if self.step % 10 == 0 or 0 <= self.step <= 5:
+        n = self._config.log_every_n_steps or 100
+        if self.step % n == 0 or 0 <= self.step <= 5:
             self._step_log(
                 "loss=%s aux=%s",
                 outputs["loss"],
@@ -1215,15 +1235,18 @@ class SpmdTrainer(Module):
         state: TrainerState,
         input_batch: dict[str, Any],
     ) -> tuple[TrainerState, NestedTensor]:
+        def train_cast(in_tree):
+            per_param_train_dtype = self._per_param_train_dtype(in_tree)
+            return utils.cast_floats_per_param(in_tree, per_param_train_dtype)
+
+        # Cast before dispatching to speed up matmul and decrease memory imprint.
+        input_batch = train_cast(input_batch)
+
         # Shard and (possibly) dispatch the input batch.
         input_batch = self.input.dispatch_global_batch(input_batch)
         new_prng_key, param_noise_key, forward_key, learner_key = jax.random.split(
             state.prng_key, 4
         )
-
-        def train_cast(in_tree):
-            per_param_train_dtype = self._per_param_train_dtype(in_tree)
-            return utils.cast_floats_per_param(in_tree, per_param_train_dtype)
 
         # A nested tree of booleans.
         should_compute_gradients = self.learner.should_update_with_optimizers(state.model)
@@ -1242,7 +1265,9 @@ class SpmdTrainer(Module):
                 prng_key=inputs["forward_key"],
                 output_collection=model_output_collection,
             ):
-                loss, aux = self.model(input_batch=train_cast(inputs["input_batch"]))
+                # Copy tree to avoid tracer leaks when input_batch is changed by the model.
+                input_batch_copy = jax.tree.map(lambda x: x, inputs["input_batch"])
+                loss, aux = self.model(input_batch=input_batch_copy)
             return ForwardOutputs(loss=loss, aux=aux, output_collection=model_output_collection)
 
         # `grads` are computed for `model_parameters_grad`.
